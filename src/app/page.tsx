@@ -1,11 +1,17 @@
 import { listAllTickets } from "@/lib/zoho";
 import { TicketsTable } from "@/components/tickets-table";
+import { ViewPicker } from "@/components/view-picker";
 import { cookies } from "next/headers";
 import { AUTH_COOKIE } from "@/lib/auth";
 import { redirect } from "next/navigation";
+import { findViewBySlug } from "@/lib/views";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
+
+type SearchParams = Promise<{ view?: string }>;
+
+const MAX_TICKETS = 3000;
 
 async function logout() {
   "use server";
@@ -20,19 +26,23 @@ async function refresh() {
   revalidatePath("/");
 }
 
-export default async function Page() {
-  const departmentId = process.env.ZOHO_DEPARTMENT_ID;
+export default async function Page({ searchParams }: { searchParams: SearchParams }) {
+  const { view: viewSlug } = await searchParams;
+  const currentView = findViewBySlug(viewSlug);
+
   let tickets: Awaited<ReturnType<typeof listAllTickets>> = [];
   let loadError: string | null = null;
 
   try {
     tickets = await listAllTickets({
-      departmentId: departmentId || undefined,
-      max: 3000,
+      viewId: currentView.viewId,
+      max: MAX_TICKETS,
     });
   } catch (e) {
     loadError = e instanceof Error ? e.message : String(e);
   }
+
+  const cappedAtLimit = tickets.length >= MAX_TICKETS;
 
   const problems = Array.from(
     new Set(
@@ -92,6 +102,16 @@ export default async function Page() {
           </div>
         </header>
 
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <ViewPicker currentSlug={currentView.slug} />
+          {cappedAtLimit ? (
+            <div className="rounded-md border border-brand-amber/40 bg-brand-amber/10 px-3 py-1.5 text-xs text-[color:var(--brand-amber)]">
+              Loaded most recent {MAX_TICKETS.toLocaleString()} of ~
+              {currentView.expectedCount.toLocaleString()} tickets in this view.
+            </div>
+          ) : null}
+        </div>
+
         {loadError ? (
           <div className="rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
             Failed to load tickets: {loadError}
@@ -99,7 +119,7 @@ export default async function Page() {
         ) : (
           <>
             <div className="mb-4 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-              <KpiCard label="Total Tickets" value={totalTickets} />
+              <KpiCard label={`Tickets in ${currentView.label}`} value={totalTickets} />
               <KpiCard
                 label="No Problem Set"
                 value={noneCount}

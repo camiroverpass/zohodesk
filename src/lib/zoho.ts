@@ -99,6 +99,7 @@ type RawTicket = {
 };
 
 export async function listAllTickets(params: {
+  viewId?: string;
   departmentId?: string;
   max?: number;
 }): Promise<Ticket[]> {
@@ -115,7 +116,8 @@ export async function listAllTickets(params: {
       include: "contacts",
       sortBy: "-createdTime",
     });
-    if (params.departmentId) qs.set("departmentId", params.departmentId);
+    if (params.viewId) qs.set("viewId", params.viewId);
+    else if (params.departmentId) qs.set("departmentId", params.departmentId);
 
     const res = await zohoFetch(`/tickets?${qs.toString()}`);
     if (res.status === 204) break;
