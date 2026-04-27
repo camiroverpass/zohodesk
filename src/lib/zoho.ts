@@ -180,3 +180,134 @@ export async function bulkUpdateTicketProblem(
   }
   return { updated, failed };
 }
+
+export type LastActivity = {
+  type: "thread" | "comment" | "other";
+  channel: string | null;
+  direction: "in" | "out" | null;
+  preview: string;
+  createdTime: string;
+  authorName: string | null;
+  isPublic: boolean | null;
+};
+
+type RawConversationItem = {
+  id?: string;
+  type?: string;
+  channel?: string | null;
+  direction?: string | null;
+  summary?: string | null;
+  content?: string | null;
+  commentContent?: string | null;
+  createdTime?: string;
+  isPublic?: boolean | null;
+  author?: {
+    name?: string | null;
+    firstName?: string | null;
+    lastName?: string | null;
+    email?: string | null;
+  } | null;
+  commenter?: {
+    name?: string | null;
+    firstName?: string | null;
+    lastName?: string | null;
+  } | null;
+  fromEmailAddress?: string | null;
+};
+
+function stripHtml(input: string): string {
+  return input
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function authorOf(item: RawConversationItem): string | null {
+  if (item.author) {
+    const composed = [item.author.firstName, item.author.lastName]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+    return item.author.name || composed || item.author.email || null;
+  }
+  if (item.commenter) {
+    const composed = [item.commenter.firstName, item.commenter.lastName]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+    return item.commenter.name || composed || null;
+  }
+  return item.fromEmailAddress ?? null;
+}
+
+function toLastActivity(item: RawConversationItem): LastActivity {
+  const kind: LastActivity["type"] =
+    item.type === "thread" ? "thread" : item.type === "comment" ? "comment" : "other";
+  const rawText =
+    kind === "comment"
+      ? item.content ?? item.commentContent ?? ""
+      : item.summary ?? item.content ?? "";
+  const preview = stripHtml(rawText).slice(0, 240);
+  const direction =
+    item.direction === "in" || item.direction === "out" ? item.direction : null;
+  return {
+    type: kind,
+    channel: item.channel ?? null,
+    direction,
+    preview,
+    createdTime: item.createdTime ?? "",
+    authorName: authorOf(item),
+    isPublic: typeof item.isPublic === "boolean" ? item.isPublic : null,
+  };
+}
+
+export async function getLastActivityForTicket(
+  ticketId: string,
+): Promise<LastActivity | null> {
+  // Conversations are returned chronologically; page until a partial page is hit
+  // and take the last item across all pages.
+  const limit = 99;
+  let from = 1;
+  let last: RawConversationItem | null = null;
+  for (let i = 0; i < 20; i++) {
+    const res = await zohoFetch(
+      `/tickets/${ticketId}/conversations?from=${from}&limit=${limit}`,
+    );
+    if (res.status === 204) break;
+    if (!res.ok) return null;
+    const json = (await res.json()) as { data?: RawConversationItem[] };
+    const data = json.data ?? [];
+    if (!data.length) break;
+    last = data[data.length - 1];
+    if (data.length < limit) break;
+    from += limit;
+  }
+  return last ? toLastActivity(last) : null;
+}
+
+export async function bulkGetLastActivities(
+  ticketIds: string[],
+): Promise<Record<string, LastActivity | null>> {
+  const out: Record<string, LastActivity | null> = {};
+  const concurrency = 6;
+  for (let i = 0; i < ticketIds.length; i += concurrency) {
+    const batch = ticketIds.slice(i, i + concurrency);
+    const results = await Promise.allSettled(
+      batch.map((id) => getLastActivityForTicket(id)),
+    );
+    results.forEach((r, idx) => {
+      out[batch[idx]] = r.status === "fulfilled" ? r.value : null;
+    });
+  }
+  return out;
+}

@@ -1,8 +1,8 @@
 "use client";
 
-import { useMemo, useState, useTransition } from "react";
-import type { Ticket } from "@/lib/zoho";
-import { changeProblemForTickets } from "@/app/actions";
+import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
+import type { LastActivity, Ticket } from "@/lib/zoho";
+import { changeProblemForTickets, getLastActivitiesForTickets } from "@/app/actions";
 import {
   Table,
   TableBody,
@@ -128,6 +128,107 @@ function ProblemBadge({ value }: { value: string }) {
   );
 }
 
+type ActivityState = LastActivity | "loading" | "error";
+
+function activityLabel(a: LastActivity): string {
+  if (a.type === "thread") {
+    const channel = a.channel ? a.channel.toLowerCase() : "email";
+    if (a.direction === "in") return `${channel} from customer`;
+    if (a.direction === "out") return `${channel} to customer`;
+    return channel;
+  }
+  if (a.type === "comment") {
+    return a.isPublic === false ? "private comment" : "comment";
+  }
+  return "activity";
+}
+
+function activityToneClass(a: LastActivity): string {
+  if (a.type === "comment") {
+    return a.isPublic === false
+      ? "bg-brand-amber/15 text-[color:var(--brand-amber)]"
+      : "bg-brand-navy/10 text-brand-navy";
+  }
+  if (a.type === "thread") {
+    return a.direction === "in"
+      ? "bg-brand-coral/10 text-brand-coral"
+      : "bg-brand-green/15 text-brand-green";
+  }
+  return "bg-slate-100 text-slate-700";
+}
+
+function ActivityPreview({ activity }: { activity: LastActivity }) {
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center gap-2">
+        <span
+          className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${activityToneClass(activity)}`}
+        >
+          {activityLabel(activity)}
+        </span>
+        {activity.authorName ? (
+          <span className="truncate text-[11px] text-muted-foreground" title={activity.authorName}>
+            {activity.authorName}
+          </span>
+        ) : null}
+      </div>
+      <p
+        className="line-clamp-2 text-xs text-foreground/80"
+        title={activity.preview || undefined}
+      >
+        {activity.preview || <span className="italic text-muted-foreground">No content</span>}
+      </p>
+    </div>
+  );
+}
+
+function LastActivityCell({
+  ticketId,
+  state,
+  onVisible,
+}: {
+  ticketId: string;
+  state: ActivityState | undefined;
+  onVisible: (id: string) => void;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (state !== undefined) return;
+    const el = ref.current;
+    if (!el) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            onVisible(ticketId);
+            observer.disconnect();
+            break;
+          }
+        }
+      },
+      { rootMargin: "200px 0px" },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [state, ticketId, onVisible]);
+
+  if (state === undefined) {
+    return (
+      <div ref={ref} className="text-xs italic text-muted-foreground">
+        …
+      </div>
+    );
+  }
+  if (state === "loading") {
+    return <div className="text-xs italic text-muted-foreground">Loading…</div>;
+  }
+  if (state === "error") {
+    return <span className="text-xs text-muted-foreground">—</span>;
+  }
+  return <ActivityPreview activity={state} />;
+}
+
 export function TicketsTable({ tickets, knownProblems }: Props) {
   const [filter, setFilter] = useState<string>(ALL_VALUE);
   const [search, setSearch] = useState("");
@@ -137,6 +238,51 @@ export function TicketsTable({ tickets, knownProblems }: Props) {
   const [customProblem, setCustomProblem] = useState("");
   const [isPending, startTransition] = useTransition();
   const [result, setResult] = useState<{ updated: number; failed: number } | null>(null);
+  const [activities, setActivities] = useState<Map<string, ActivityState>>(new Map());
+  const requestedRef = useRef<Set<string>>(new Set());
+  const pendingRef = useRef<Set<string>>(new Set());
+  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const requestActivity = useCallback((id: string) => {
+    if (requestedRef.current.has(id)) return;
+    requestedRef.current.add(id);
+    pendingRef.current.add(id);
+    setActivities((prev) => {
+      const next = new Map(prev);
+      next.set(id, "loading");
+      return next;
+    });
+    if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
+    flushTimerRef.current = setTimeout(async () => {
+      const ids = Array.from(pendingRef.current);
+      pendingRef.current.clear();
+      flushTimerRef.current = null;
+      if (!ids.length) return;
+      try {
+        const result = await getLastActivitiesForTickets(ids);
+        setActivities((prev) => {
+          const next = new Map(prev);
+          for (const id of ids) {
+            const value = result[id];
+            next.set(id, value ?? "error");
+          }
+          return next;
+        });
+      } catch {
+        setActivities((prev) => {
+          const next = new Map(prev);
+          for (const id of ids) next.set(id, "error");
+          return next;
+        });
+      }
+    }, 200);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
+    };
+  }, []);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -377,6 +523,9 @@ export function TicketsTable({ tickets, knownProblems }: Props) {
               <TableHead className="w-[240px] text-xs uppercase tracking-widest text-muted-foreground">
                 Customer
               </TableHead>
+              <TableHead className="w-[320px] text-xs uppercase tracking-widest text-muted-foreground">
+                Last activity
+              </TableHead>
               <TableHead className="w-32 text-xs uppercase tracking-widest text-muted-foreground">
                 Date
               </TableHead>
@@ -388,7 +537,7 @@ export function TicketsTable({ tickets, knownProblems }: Props) {
           <TableBody>
             {filtered.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={6} className="py-10 text-center text-muted-foreground">
+                <TableCell colSpan={7} className="py-10 text-center text-muted-foreground">
                   No tickets match.
                 </TableCell>
               </TableRow>
@@ -430,6 +579,13 @@ export function TicketsTable({ tickets, knownProblems }: Props) {
                           </div>
                         ) : null}
                       </div>
+                    </TableCell>
+                    <TableCell className="max-w-[320px] align-top">
+                      <LastActivityCell
+                        ticketId={t.id}
+                        state={activities.get(t.id)}
+                        onVisible={requestActivity}
+                      />
                     </TableCell>
                     <TableCell className="text-sm">{formatDate(t.createdTime)}</TableCell>
                     <TableCell>
