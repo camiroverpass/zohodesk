@@ -43,3 +43,7 @@ next-env.d.ts
 
 .vercel
 .claude/
+
+# local data exports (customer content)
+goldset.csv
+goldset.xlsx

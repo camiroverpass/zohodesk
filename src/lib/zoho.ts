@@ -149,6 +149,35 @@ export async function listAllTickets(params: {
   return out;
 }
 
+// Fetch a single ticket by id. Returns null on 404/204. Used by the webhook to read
+// the authoritative subject + current cf_problem before auto-tagging.
+export async function getTicketById(ticketId: string): Promise<Ticket | null> {
+  // The single-ticket GET (unlike /tickets list) rejects a `fields` param; it
+  // returns custom fields (cf.*) by default. Only `include` is supported here.
+  const res = await zohoFetch(`/tickets/${ticketId}?include=contacts`);
+  if (res.status === 204 || res.status === 404) return null;
+  if (!res.ok) {
+    throw new Error(`Zoho get ticket failed for ${ticketId}: ${res.status} ${await res.text()}`);
+  }
+  const t = (await res.json()) as RawTicket;
+  return {
+    id: t.id,
+    ticketNumber: t.ticketNumber,
+    subject: t.subject,
+    createdTime: t.createdTime,
+    webUrl: t.webUrl,
+    problem: t.cf?.cf_problem ?? null,
+    contact: t.contact
+      ? {
+          id: t.contact.id,
+          firstName: t.contact.firstName,
+          lastName: t.contact.lastName,
+          email: t.contact.email,
+        }
+      : null,
+  };
+}
+
 export async function updateTicketProblem(
   ticketId: string,
   problem: string | null,
@@ -181,6 +210,33 @@ export async function bulkUpdateTicketProblem(
     });
   }
   return { updated, failed };
+}
+
+// First conversation thread's summary per ticket (the original message). Most
+// ticket descriptions are empty — the real content lives in threads. Used to give
+// the AI classifier real signal. Bounded concurrency; best-effort (skips failures).
+export async function fetchThreadSummaries(
+  ticketIds: string[],
+): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  const concurrency = 5;
+  for (let i = 0; i < ticketIds.length; i += concurrency) {
+    const batch = ticketIds.slice(i, i + concurrency);
+    await Promise.all(
+      batch.map(async (id) => {
+        try {
+          const res = await zohoFetch(`/tickets/${id}/threads?limit=1`);
+          if (!res.ok) return;
+          const json = (await res.json()) as { data?: { summary?: string | null }[] };
+          const summary = json.data?.[0]?.summary;
+          if (summary) out[id] = stripHtml(summary).slice(0, 800);
+        } catch {
+          // best-effort: leave this ticket without enriched content
+        }
+      }),
+    );
+  }
+  return out;
 }
 
 export type LastActivity = {

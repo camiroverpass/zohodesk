@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { AUTH_COOKIE, expectedToken } from "@/lib/auth";
 
-const PUBLIC_PATHS = ["/login", "/api/login"];
+// The auto-tag entry points are public to the proxy but self-guard with their own
+// secrets (ZOHO_WEBHOOK_SECRET / CRON_SECRET) — the dashboard password must not block them.
+const PUBLIC_PATHS = ["/login", "/api/login", "/api/zoho-webhook", "/api/cron"];
 
 export async function proxy(req: NextRequest) {
   const { pathname } = req.nextUrl;

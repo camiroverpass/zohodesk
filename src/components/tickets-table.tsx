@@ -2,7 +2,12 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import type { LastActivity, Ticket } from "@/lib/zoho";
-import { changeProblemForTickets, getLastActivitiesForTickets } from "@/app/actions";
+import type { Suggestion, Confidence } from "@/lib/classify";
+import {
+  changeProblemForTickets,
+  getLastActivitiesForTickets,
+  suggestTagsForTickets,
+} from "@/app/actions";
 import {
   Table,
   TableBody,
@@ -128,6 +133,24 @@ function ProblemBadge({ value }: { value: string }) {
   );
 }
 
+const CONFIDENCE_CLASSES: Record<Confidence, string> = {
+  high: "bg-brand-green/15 text-brand-green",
+  medium: "bg-brand-amber/15 text-[color:var(--brand-amber)]",
+  low: "bg-slate-100 text-slate-600",
+};
+
+function ConfidencePill({ c }: { c: Confidence }) {
+  return (
+    <span
+      className={`inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider ${CONFIDENCE_CLASSES[c]}`}
+    >
+      {c}
+    </span>
+  );
+}
+
+const MAX_SUGGEST = 60;
+
 type ActivityState = LastActivity | "loading" | "error";
 
 function activityLabel(a: LastActivity): string {
@@ -239,6 +262,10 @@ export function TicketsTable({ tickets, knownProblems }: Props) {
   const [isPending, startTransition] = useTransition();
   const [result, setResult] = useState<{ updated: number; failed: number } | null>(null);
   const [activities, setActivities] = useState<Map<string, ActivityState>>(new Map());
+  const [suggestions, setSuggestions] = useState<Map<string, Suggestion>>(new Map());
+  const [isSuggesting, startSuggest] = useTransition();
+  const [isApplying, startApply] = useTransition();
+  const [applyingId, setApplyingId] = useState<string | null>(null);
   const requestedRef = useRef<Set<string>>(new Set());
   const pendingRef = useRef<Set<string>>(new Set());
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -346,6 +373,60 @@ export function TicketsTable({ tickets, knownProblems }: Props) {
     });
   }
 
+  const suggestTargets = filtered.slice(0, MAX_SUGGEST);
+  const highConfCount = filtered.filter(
+    (t) => suggestions.get(t.id)?.confidence === "high",
+  ).length;
+
+  function handleSuggest() {
+    const targets = suggestTargets.map((t) => ({ id: t.id, subject: t.subject }));
+    if (!targets.length) return;
+    startSuggest(async () => {
+      const res = await suggestTagsForTickets(targets);
+      setSuggestions((prev) => {
+        const next = new Map(prev);
+        for (const [id, s] of Object.entries(res)) next.set(id, s);
+        return next;
+      });
+    });
+  }
+
+  function applyOne(id: string, category: string) {
+    setApplyingId(id);
+    startApply(async () => {
+      await changeProblemForTickets([id], category);
+      setApplyingId(null);
+      setSuggestions((prev) => {
+        const next = new Map(prev);
+        next.delete(id);
+        return next;
+      });
+    });
+  }
+
+  function applyHighConfidence() {
+    const items = filtered.filter((t) => suggestions.get(t.id)?.confidence === "high");
+    if (!items.length) return;
+    startApply(async () => {
+      const byCategory = new Map<string, string[]>();
+      for (const t of items) {
+        const s = suggestions.get(t.id);
+        if (!s) continue;
+        const arr = byCategory.get(s.category) ?? [];
+        arr.push(t.id);
+        byCategory.set(s.category, arr);
+      }
+      for (const [category, ids] of byCategory) {
+        await changeProblemForTickets(ids, category);
+      }
+      setSuggestions((prev) => {
+        const next = new Map(prev);
+        for (const t of items) next.delete(t.id);
+        return next;
+      });
+    });
+  }
+
   const fromLabel =
     filter === NONE_VALUE ? "-None-" : filter === ALL_VALUE ? "any value" : filter;
 
@@ -440,6 +521,19 @@ export function TicketsTable({ tickets, knownProblems }: Props) {
             </p>
           </div>
           <div className="flex items-center gap-3">
+            <Button
+              variant="outline"
+              onClick={handleSuggest}
+              disabled={isSuggesting || filtered.length === 0}
+              title={`Classify the ${suggestTargets.length} shown ticket${suggestTargets.length === 1 ? "" : "s"} with AI (read-only)`}
+            >
+              {isSuggesting ? "Suggesting…" : `Suggest tags (AI) · ${suggestTargets.length}`}
+            </Button>
+            {highConfCount > 0 ? (
+              <Button variant="outline" onClick={applyHighConfidence} disabled={isApplying}>
+                {isApplying ? "Applying…" : `Apply ${highConfCount} high-confidence`}
+              </Button>
+            ) : null}
             <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
               <DialogTrigger asChild>
                 <Button disabled={selected.size === 0}>Change problem…</Button>
@@ -532,12 +626,15 @@ export function TicketsTable({ tickets, knownProblems }: Props) {
               <TableHead className="text-xs uppercase tracking-widest text-muted-foreground">
                 Problem
               </TableHead>
+              <TableHead className="w-[240px] text-xs uppercase tracking-widest text-muted-foreground">
+                AI suggestion
+              </TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {filtered.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-muted-foreground">
+                <TableCell colSpan={8} className="py-10 text-center text-muted-foreground">
                   No tickets match.
                 </TableCell>
               </TableRow>
@@ -598,6 +695,28 @@ export function TicketsTable({ tickets, knownProblems }: Props) {
                           ))}
                         </div>
                       )}
+                    </TableCell>
+                    <TableCell className="max-w-[240px] align-top">
+                      {(() => {
+                        const sug = suggestions.get(t.id);
+                        if (!sug) return <span className="text-xs text-muted-foreground">—</span>;
+                        return (
+                          <div className="space-y-1">
+                            <div className="flex flex-wrap items-center gap-1.5" title={sug.reason}>
+                              <ProblemBadge value={sug.category} />
+                              <ConfidencePill c={sug.confidence} />
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => applyOne(t.id, sug.category)}
+                              disabled={isApplying}
+                              className="text-[11px] font-medium text-brand-coral hover:underline disabled:opacity-50"
+                            >
+                              {applyingId === t.id ? "Applying…" : "Apply"}
+                            </button>
+                          </div>
+                        );
+                      })()}
                     </TableCell>
                   </TableRow>
                 );
